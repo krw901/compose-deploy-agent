@@ -10,15 +10,43 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/krwu/compose-deploy-agent/internal/deployer"
 	"github.com/krwu/compose-deploy-agent/internal/store"
 )
+
+// Connection limits applied to every listener. The main listener is meant
+// to be reachable from CI (possibly through a TCP passthrough on a public
+// 443), so a slow or idle client must not be able to hold connections or
+// goroutines open indefinitely.
+const (
+	// defaultReadHeaderTimeout also bounds the TLS handshake: net/http
+	// uses the smallest non-zero read/write timeout as the handshake
+	// deadline.
+	defaultReadHeaderTimeout = 10 * time.Second
+	defaultReadTimeout       = 30 * time.Second
+	defaultWriteTimeout      = 30 * time.Second
+	defaultIdleTimeout       = 60 * time.Second
+	maxHeaderBytes           = 16 << 10
+	// maxRequestBodyBytes caps request bodies; a deploy request is a few
+	// hundred bytes.
+	maxRequestBodyBytes = 64 << 10
+)
+
+// serverTimeouts are the per-listener http.Server timeouts; tests shrink them.
+type serverTimeouts struct {
+	readHeader time.Duration
+	read       time.Duration
+	write      time.Duration
+	idle       time.Duration
+}
 
 // Server bundles everything the HTTP handlers need.
 type Server struct {
@@ -26,6 +54,8 @@ type Server struct {
 	store     *store.Store
 	version   string
 	startedAt time.Time
+	timeouts  serverTimeouts
+	maxConns  int
 }
 
 // New returns a Server ready to build handlers for.
@@ -35,6 +65,35 @@ func New(dep *deployer.Deployer, s *store.Store, version string) *Server {
 		store:     s,
 		version:   version,
 		startedAt: time.Now(),
+		timeouts: serverTimeouts{
+			readHeader: defaultReadHeaderTimeout,
+			read:       defaultReadTimeout,
+			write:      defaultWriteTimeout,
+			idle:       defaultIdleTimeout,
+		},
+		maxConns: DefaultMaxConnections,
+	}
+}
+
+// SetMaxConnections sets the cap on concurrently open connections to the
+// main listener (see limitListener). Values < 1 keep the current cap. It
+// must be called before MainListener/ServeMainOn.
+func (s *Server) SetMaxConnections(n int) {
+	if n >= 1 {
+		s.maxConns = n
+	}
+}
+
+// newHTTPServer returns an http.Server for handler with the connection
+// limits applied.
+func (s *Server) newHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: s.timeouts.readHeader,
+		ReadTimeout:       s.timeouts.read,
+		WriteTimeout:      s.timeouts.write,
+		IdleTimeout:       s.timeouts.idle,
+		MaxHeaderBytes:    maxHeaderBytes,
 	}
 }
 
@@ -53,14 +112,13 @@ func (s *Server) MainListener(ctx context.Context, addr string, tlsConfig *tls.C
 // protoDemux. Split out from MainListener so
 // tests can bind an ephemeral port ("127.0.0.1:0") and learn the actual
 // port before connecting.
-func (server *Server) ServeMainOn(ctx context.Context, ln net.Listener, tlsConfig *tls.Config) error {
+func (server *Server) ServeMainOn(ctx context.Context, rawLn net.Listener, tlsConfig *tls.Config) error {
+	ln := newLimitListener(rawLn, server.maxConns)
 	demux := newProtoDemux(ln)
 
-	tlsSrv := &http.Server{
-		Handler:   fingerprintMiddleware(server.store)(server.mainRouter()),
-		TLSConfig: tlsConfig,
-	}
-	plainSrv := &http.Server{Handler: server.publicRouter()}
+	tlsSrv := server.newHTTPServer(fingerprintMiddleware(server.store)(server.mainRouter()))
+	tlsSrv.TLSConfig = tlsConfig
+	plainSrv := server.newHTTPServer(server.publicRouter())
 
 	errCh := make(chan error, 2)
 	go func() { errCh <- tlsSrv.Serve(tls.NewListener(demux.tls, tlsConfig)) }()
@@ -87,10 +145,8 @@ func (server *Server) ServeMainOn(ctx context.Context, ln net.Listener, tlsConfi
 // HealthzListener starts the plain-HTTP healthz listener, always bound to
 // loopback so that monitoring never needs a client certificate.
 func (s *Server) HealthzListener(ctx context.Context, addr string) error {
-	srv := &http.Server{
-		Addr:    addr,
-		Handler: s.healthzRouter(),
-	}
+	srv := s.newHTTPServer(s.healthzRouter())
+	srv.Addr = addr
 	return serveUntilDone(ctx, srv, srv.ListenAndServe)
 }
 
@@ -98,13 +154,23 @@ func (s *Server) HealthzListener(ctx context.Context, addr string) error {
 // same /v1/* routes as the mTLS listener, but without mTLS or the
 // fingerprint middleware: whoever can reach the socket file has already
 // proven host access, which this system treats as the real trust root.
-// Any stale socket file left behind by a
-// previous unclean shutdown is removed first; this is safe because the
+// Requests are tagged with the local identity (localIdentityMiddleware).
+//
+// The socket's parent directory is the real access boundary: it must be
+// owned by the running user and inaccessible to group and others (see
+// ensurePrivateDir), so the socket is never reachable by anyone else, not
+// even between Listen and the Chmod below. The process umask is
+// deliberately left alone - it is process-wide and would race the sqlite
+// and .env writes of other goroutines. Any stale socket file left behind by
+// a previous unclean shutdown is removed first; this is safe because the
 // caller already holds the single-instance lock (internal/singleton). The
-// socket is chmod'd to 0600 so only the owning user (root, per the systemd
-// unit) can connect.
+// 0600 chmod is a second layer.
 func (s *Server) LocalListener(ctx context.Context, socketPath string) error {
-	err := os.Remove(socketPath)
+	err := ensurePrivateDir(filepath.Dir(socketPath))
+	if err != nil {
+		return fmt.Errorf("unix socket %s: %w", socketPath, err)
+	}
+	err = os.Remove(socketPath)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -114,11 +180,12 @@ func (s *Server) LocalListener(ctx context.Context, socketPath string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.Chmod(socketPath, 0o600); err != nil {
+	err = os.Chmod(socketPath, 0o600)
+	if err != nil {
 		ln.Close()
 		return err
 	}
-	srv := &http.Server{Handler: s.mainRouter()}
+	srv := s.newHTTPServer(localIdentityMiddleware(s.mainRouter()))
 	return serveUntilDone(ctx, srv, func() error {
 		return srv.Serve(ln)
 	})

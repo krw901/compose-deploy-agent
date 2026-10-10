@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
@@ -23,7 +24,7 @@ func (s *Server) mainRouter() http.Handler {
 	mux.HandleFunc("GET /v1/deploys/{id}", s.handleGetDeploy)
 	mux.HandleFunc("GET /v1/status/{service}", s.handleGetStatus)
 	mux.HandleFunc("GET /v1/version", s.handleVersion)
-	return mux
+	return limitBody(mux)
 }
 
 // publicRouter builds the mux served over the plain-HTTP sub-stream of
@@ -35,7 +36,7 @@ func (s *Server) mainRouter() http.Handler {
 func (s *Server) publicRouter() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/version", s.handleVersion)
-	return mux
+	return limitBody(mux)
 }
 
 // healthzRouter builds the plain-HTTP mux served on 127.0.0.1:8867.
@@ -62,17 +63,21 @@ func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (server *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
-	var req api.DeployRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, api.ErrInvalidParam, "invalid JSON body")
+	req, ok := decodeDeployRequest(w, r)
+	if !ok {
 		return
 	}
-	if req.Service == "" || req.Tag == "" {
-		writeError(w, http.StatusBadRequest, api.ErrInvalidParam, "service and tag are required")
+	if !server.authorizeService(w, r, req.Service) {
 		return
 	}
 
-	deployID, _, err := server.deployer.StartDeploy(r.Context(), req.Service, req.Tag)
+	var deployID string
+	var err error
+	if req.Digest != "" {
+		deployID, _, err = server.deployer.StartDeployDigest(r.Context(), req.Service, req.Digest)
+	} else {
+		deployID, _, err = server.deployer.StartDeploy(r.Context(), req.Service, req.Tag)
+	}
 	if err != nil {
 		server.writeStartDeployError(w, err)
 		return
@@ -82,8 +87,49 @@ func (server *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		DeployID: deployID,
 		Service:  req.Service,
 		Tag:      req.Tag,
+		Digest:   req.Digest,
 		State:    api.StateDeploying,
 	})
+}
+
+// decodeDeployRequest parses a POST /v1/deploy body strictly: unknown
+// fields are rejected (the request can never smuggle in options such as a
+// post_deploy user or command), the body must hold exactly one JSON value
+// (only whitespace may follow it), and exactly one of tag and digest must
+// be set. On failure it writes the error response and returns false.
+func decodeDeployRequest(w http.ResponseWriter, r *http.Request) (api.DeployRequest, bool) {
+	var req api.DeployRequest
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	err := dec.Decode(&req)
+	if err != nil {
+		writeBodyError(w, err)
+		return req, false
+	}
+	_, err = dec.Token()
+	if !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("unexpected data after JSON value")
+		}
+		writeBodyError(w, err)
+		return req, false
+	}
+	if req.Service == "" || (req.Tag == "") == (req.Digest == "") {
+		writeError(w, http.StatusBadRequest, api.ErrInvalidParam,
+			"service and exactly one of tag or digest are required")
+		return req, false
+	}
+	return req, true
+}
+
+// writeBodyError maps a request body read/parse error to 413 (size limit)
+// or 400.
+func writeBodyError(w http.ResponseWriter, err error) {
+	if _, tooLarge := errors.AsType[*http.MaxBytesError](err); tooLarge {
+		writeError(w, http.StatusRequestEntityTooLarge, api.ErrBodyTooLarge, "request body too large")
+		return
+	}
+	writeError(w, http.StatusBadRequest, api.ErrInvalidParam, fmt.Sprintf("invalid JSON body: %v", err))
 }
 
 func (s *Server) writeStartDeployError(w http.ResponseWriter, err error) {
@@ -116,11 +162,17 @@ func (s *Server) handleGetDeploy(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, api.ErrInternal, "internal error")
 		return
 	}
+	if !s.authorizeService(w, r, status.Service) {
+		return
+	}
 	writeJSON(w, http.StatusOK, status)
 }
 
 func (s *Server) handleGetStatus(w http.ResponseWriter, r *http.Request) {
 	service := r.PathValue("service")
+	if !s.authorizeService(w, r, service) {
+		return
+	}
 	status, err := s.deployer.GetServiceStatus(r.Context(), service)
 	if err != nil {
 		var notFound deployer.ErrServiceNotFound

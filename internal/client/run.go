@@ -27,6 +27,7 @@ func Run(ctx context.Context, opts Options) Summary {
 	summary := Summary{
 		Service: opts.Service,
 		Tag:     opts.Tag,
+		Digest:  opts.Digest,
 	}
 
 	bundle, err := credential.Parse(opts.CredentialPEM)
@@ -52,6 +53,7 @@ func RunLocal(ctx context.Context, socketPath string, opts Options) Summary {
 	summary := Summary{
 		Service: opts.Service,
 		Tag:     opts.Tag,
+		Digest:  opts.Digest,
 	}
 
 	httpClient := newUnixHTTPClient(socketPath)
@@ -88,6 +90,7 @@ func submit(ctx context.Context, httpClient *http.Client, opts Options, deadline
 	body, _ := json.Marshal(api.DeployRequest{
 		Service: opts.Service,
 		Tag:     opts.Tag,
+		Digest:  opts.Digest,
 	})
 	connectAttempts := 0
 

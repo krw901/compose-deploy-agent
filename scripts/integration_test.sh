@@ -25,7 +25,7 @@ CGO_ENABLED=0 go build -o "${WORK_DIR}/deploy-agent" "${ROOT}/cmd/deploy-agent"
 
 DATA_DIR="${WORK_DIR}/data"
 MANIFEST="${WORK_DIR}/services.yaml"
-mkdir -p "$DATA_DIR"
+mkdir -p -m 0700 "$DATA_DIR"
 
 # --- fixture 1: a normal long-running service with a HEALTHCHECK ---
 GOOD_DIR="${WORK_DIR}/good"
@@ -93,31 +93,31 @@ deploy() {
 }
 
 echo "== scenario: first deploy (success, healthcheck) =="
-deploy good "3.19"
-echo "expect .env IMAGE_TAG=3.19 in ${GOOD_DIR}"
-grep -q '^IMAGE_TAG=3.19$' "${GOOD_DIR}/.env"
+deploy good "musl"
+echo "expect .env IMAGE_TAG=musl in ${GOOD_DIR}"
+grep -q '^IMAGE_TAG=musl$' "${GOOD_DIR}/.env"
 
 echo "== scenario: redeploy same tag (noop) =="
-deploy good "3.19"
+deploy good "musl"
 
 echo "== scenario: first deploy of an always-crashing service (no rollback target) =="
-if deploy crash "3.19"; then
+if deploy crash "musl"; then
   echo "expected the crashing deploy to fail" >&2
   exit 1
 fi
 
 echo "== scenario: healthy service, then bad tag (rollback to previous tag) =="
-deploy good "3.20"
+deploy good "glibc"
 if deploy good "does-not-exist-tag"; then
   echo "expected the bad-tag deploy to fail" >&2
   exit 1
 fi
-echo "expect .env to have rolled back to IMAGE_TAG=3.20"
-grep -q '^IMAGE_TAG=3.20$' "${GOOD_DIR}/.env"
+echo "expect .env to have rolled back to IMAGE_TAG=glibc"
+grep -q '^IMAGE_TAG=glibc$' "${GOOD_DIR}/.env"
 
 echo "== scenario: deploy-agent update via local unix socket (no endpoint/mTLS) =="
-"${WORK_DIR}/deploy-agent" update -s good -t "3.19" --data-dir "$DATA_DIR" --poll-timeout 2m
-echo "expect .env IMAGE_TAG=3.19 in ${GOOD_DIR} after update"
-grep -q '^IMAGE_TAG=3.19$' "${GOOD_DIR}/.env"
+"${WORK_DIR}/deploy-agent" update -s good -t "musl" --data-dir "$DATA_DIR" --poll-timeout 2m
+echo "expect .env IMAGE_TAG=musl in ${GOOD_DIR} after update"
+grep -q '^IMAGE_TAG=musl$' "${GOOD_DIR}/.env"
 
 echo "ALL SCENARIOS PASSED"

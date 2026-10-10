@@ -114,3 +114,26 @@ func (c *Client) ContainerID(ctx context.Context, dir, file, composeService stri
 	id := firstLine(out.Stdout)
 	return id, nil
 }
+
+// ExecSpec is a fixed command run inside a compose service's container.
+type ExecSpec struct {
+	Dir            string
+	File           string
+	ComposeService string
+	User           string
+	Args           []string
+}
+
+// Exec runs `docker compose exec -T -u <user> <service> <args...>` as an
+// argument array (no shell). The returned Output carries the exit code;
+// callers bound the run with ctx.
+func (c *Client) Exec(ctx context.Context, spec ExecSpec) (Output, error) {
+	argv := make([]string, 0, len(spec.Args)+7)
+	argv = append(argv, "compose", "-f", spec.File, "exec", "-T", "-u", spec.User, spec.ComposeService)
+	argv = append(argv, spec.Args...)
+	out, err := c.runner.Run(ctx, spec.Dir, nil, "docker", argv...)
+	if err != nil {
+		return out, fmt.Errorf("docker compose exec: %w: %s", err, out.Stderr)
+	}
+	return out, nil
+}

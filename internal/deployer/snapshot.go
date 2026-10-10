@@ -76,17 +76,22 @@ func currentSnapshot(ctx context.Context, docker *dockerx.Client, svc config.Ser
 	}, nil
 }
 
-// tagFromImageRef extracts the tag component from an image reference like
-// "repo:tag" or "registry.example.com:5000/ns/repo:tag". The tag can only
+// tagFromImageRef extracts the version component from an image reference
+// like "repo:tag", "registry.example.com:5000/ns/repo:tag" or
+// "repo@sha256:<hex>" (returned as "sha256:<hex>"). The tag can only
 // appear after the final "/", so a colon before that (e.g. a registry
 // port) is never mistaken for a tag separator.
 func tagFromImageRef(ref string) string {
-	tail := ref
-	if idx := strings.LastIndex(ref, "/"); idx >= 0 {
-		tail = ref[idx+1:]
+	_, digest, ok := strings.Cut(ref, "@")
+	if ok {
+		return digest
 	}
-	if idx := strings.LastIndex(tail, ":"); idx >= 0 {
-		return tail[idx+1:]
+	tail := ref
+	if _, after, found := strings.CutLast(ref, "/"); found {
+		tail = after
+	}
+	if _, tag, found := strings.CutLast(tail, ":"); found {
+		return tag
 	}
 	return ""
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"flag"
 	"fmt"
@@ -21,6 +22,11 @@ import (
 	"github.com/krwu/compose-deploy-agent/internal/tlsconf"
 )
 
+// socketFlagUsage documents --socket for serve and update.
+const socketFlagUsage = "local unix socket path (default " + paths.DefaultSocketPath +
+	", or <data-dir>/agent.sock with a non-default --data-dir); " +
+	"its directory must be 0700 and owned by the running user"
+
 // expiryCheckInterval is how often the running agent re-checks for
 // soon-to-expire client certificates ("每日定时检查").
 const expiryCheckInterval = 24 * time.Hour
@@ -35,6 +41,8 @@ func runServe(args []string) error {
 	dataDir := fs.String("data-dir", paths.DefaultDataDir, "data directory (sqlite db, CA material)")
 	bindAddr := fs.String("bind", "", "address:port for the mTLS listener, e.g. 10.0.0.5:8866")
 	healthzAddr := fs.String("healthz-bind", defaultHealthzAddr, "address:port for the plain-HTTP healthz listener")
+	socketFlag := fs.String("socket", "", socketFlagUsage)
+	maxConns := fs.Int("max-conns", server.DefaultMaxConnections, "max open connections on --bind")
 	testOnly := fs.Bool("t", false, "test the configuration and exit, without taking the instance lock or opening the database")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -54,6 +62,7 @@ func runServe(args []string) error {
 		}
 		fmt.Printf("deploy-agent: configuration test is successful (%d services, server certificate valid until %s)\n",
 			len(cfg.manifest.Services), notAfter.Format(time.DateTime))
+		printAccessWarnings(cfg.manifest)
 		return nil
 	}
 
@@ -78,28 +87,19 @@ func runServe(args []string) error {
 		slog.Warn("marked in-progress deploys as interrupted after restart", "count", n)
 	}
 
+	logAccessWarnings(cfg.manifest)
 	runReverseCalibration(context.Background(), dep, cfg.manifest)
 	logExpiringCerts(st)
 
 	srv := server.New(dep, st, version)
+	srv.SetMaxConnections(*maxConns)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	go func() {
-		ticker := time.NewTicker(expiryCheckInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				logExpiringCerts(st)
-			}
-		}
-	}()
+	go checkExpiringCertsDaily(ctx, st)
 
-	socketPath := paths.SocketPath(*dataDir)
+	socketPath := cmp.Or(*socketFlag, paths.SocketPath(*dataDir))
 	errCh := make(chan error, 3)
 	go func() { errCh <- srv.MainListener(ctx, *bindAddr, tlsConfig) }()
 	go func() { errCh <- srv.HealthzListener(ctx, *healthzAddr) }()
@@ -135,6 +135,36 @@ func runReverseCalibration(ctx context.Context, dep *deployer.Deployer, manifest
 			slog.Warn("reverse calibration: last_healthy image differs from running image",
 				"service", name, "last_healthy_image_id", status.LastHealthy.ImageID, "running_image_id", status.Running.ImageID)
 		}
+	}
+}
+
+// checkExpiringCertsDaily re-runs logExpiringCerts every
+// expiryCheckInterval until ctx is done.
+func checkExpiringCertsDaily(ctx context.Context, st *store.Store) {
+	ticker := time.NewTicker(expiryCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			logExpiringCerts(st)
+		}
+	}
+}
+
+// logAccessWarnings logs every services.yaml access configuration under
+// which some client certificate may deploy every service.
+func logAccessWarnings(manifest *config.Manifest) {
+	for _, warning := range manifest.AccessWarnings() {
+		slog.Warn("client certificate access is not restricted", "detail", warning)
+	}
+}
+
+// printAccessWarnings is logAccessWarnings for `serve -t`.
+func printAccessWarnings(manifest *config.Manifest) {
+	for _, warning := range manifest.AccessWarnings() {
+		fmt.Fprintf(os.Stderr, "deploy-agent: warning: %s\n", warning)
 	}
 }
 

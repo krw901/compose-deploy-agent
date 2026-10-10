@@ -182,6 +182,81 @@ agent 拉取时使用 `docker compose pull --policy always`，因此即使始终
 
 手写清单时 `tag_env` 的默认值仍是 `IMAGE_TAG`，不受影响。
 
+向导重新生成清单时，下文的 `image_ref`、`post_deploy`、`access` 只对「原样保留」的服务和段落有效：被重新选中的已纳管服务会按扫描结果重建，`access` 段不会写回。使用这些字段的清单请手工维护，重新生成后务必核对。
+
+#### 只接受 digest（`image_ref: digest`，可选）
+
+tag 可以被重新指向别的镜像，有推送权限的人就能改变「同一个 tag」实际部署的内容。对安全要求高的服务可以改为只接受镜像 digest：
+
+```yaml
+services:
+  web:
+    dir: /srv/web
+    file: compose.yml
+    service: web
+    image: ghcr.io/example/web
+    image_ref: digest            # 默认 tag
+    tag_env: IMAGE_DIGEST        # 可选，便于区分；默认仍为 IMAGE_TAG
+```
+
+compose 文件改为用 `@` 引用：
+
+```yaml
+services:
+  web:
+    image: ghcr.io/example/web@${IMAGE_DIGEST:?IMAGE_DIGEST is required}
+```
+
+- 请求必须带 `digest`（客户端 `--digest sha256:<64 位小写十六进制>`），带 `tag` 一律返回 400；格式严格校验为 `^sha256:[a-f0-9]{64}$`，写进 `.env` 的就是这个值，不可能注入换行或其他引用
+- 反过来，未开启 `image_ref: digest` 的服务不接受 `digest`，行为与之前完全一致
+- 幂等判断、回滚与 `last_healthy` 都以 digest 为准，回滚时 `.env` 恢复为上一个 digest。从 tag 模式切换过来后，旧的 tag 不能作为回滚目标（会报告 `no usable rollback target`），切换后第一次成功部署起即可正常回滚
+- 部署记录与状态接口中的 `target_tag`、`running_tag`、`rolled_back_to` 等字段此时填的是 digest
+
+#### 部署后执行固定命令（`post_deploy`，可选）
+
+新版本通过就绪检查后，可以在容器里执行一条固定命令（例如数据库迁移、初始化）：
+
+```yaml
+services:
+  web:
+    # ...
+    post_deploy:
+      user: www-data                         # 必填，不允许 root
+      args: [php, artisan, "lsky:preview-init"]
+      # service: web                         # 可选，在哪个 compose 服务里执行，默认就是本服务
+      # timeout: 3m                          # 可选，默认 3m，上限 5m
+```
+
+agent 实际执行的是 `docker compose -f <file> exec -T -u <user> <service> <args...>`，以参数数组调用，不经过 shell。
+
+- 命令、用户、服务全部只来自本机清单，部署请求无法影响：请求体只允许 `service` 和 `tag`/`digest` 两个字段，带任何其他字段都返回 400
+- `user` 必填，并且拒绝 root：`root`、`0`（含 `00` 等）以及 `root:…`、`0:…`、`…:root`、`…:0` 都会让清单加载失败。不提供默认值，因为镜像的默认用户往往就是 root
+- 命令退出码非 0 或超时，都算部署失败：结果为 `post_deploy_failed`，并像就绪失败一样**自动回滚**到上一个版本，`message` 里写明退出码或超时（以及 stderr 末尾一段）。回滚后不会再次执行该命令；首次部署没有可回滚的版本时只报告失败
+- 超时会 SIGKILL 整个 `docker compose exec` 进程组。注意 `docker compose exec` 客户端被杀后，容器里的进程不一定随之结束；回滚会用旧镜像重建容器，从而结束它。首次部署（无回滚目标）超时时，请自行确认容器内是否有残留进程
+- 结果为 `noop`（目标版本已在运行）时不执行
+- 整次部署仍受 10 分钟总时限约束，`timeout` 上限 5 分钟是为了给回滚留出时间
+
+#### 客户端证书与服务绑定（`access`，可选）
+
+默认情况下，任何已登记且未吊销的客户端证书都可以部署清单里的任何服务。需要按证书限制时，在清单顶层加 `access`：
+
+```yaml
+access:
+  require_binding: true          # 默认 false，见下文
+  clients:
+    ci-main:                     # 证书名称（ca issue -n），或 ca list 中的指纹
+      services: [web]
+    ci-preview:
+      services: [web-preview]
+```
+
+- 列在 `clients` 里的证书只能操作自己的 `services`；对其他服务的 `POST /v1/deploy`、`GET /v1/status/{service}`、`GET /v1/deploys/{id}` 返回 403 `cert_not_allowed`，并记录告警日志（证书名、指纹、服务）
+- 同一张证书既可按名称也可按指纹配置，指纹优先。按名称配置时，同名的所有证书共享该绑定（重签同名证书无需改清单），吊销仍按单张证书生效
+- `require_binding: false`（默认，兼容旧行为）：没有列出的证书仍可操作所有服务；`require_binding: true`：没有列出的证书一律 403。建议所有证书都配置绑定后打开它
+- `clients` 里引用了清单中不存在的服务、或 `services` 为空，清单加载失败
+- 没有配置 `access`、或 `require_binding` 为 false 时，`serve` 启动时和 `serve -t` 都会打印告警，提示存在可以部署所有服务的证书
+- 本机 unix socket（`deploy-agent update`）不受绑定限制，其信任根是主机 root 权限
+
 ### 4. 启动
 
 安装向导的最后一步会询问是否启动；手动配置时执行：
@@ -203,14 +278,21 @@ curl http://127.0.0.1:8867/healthz
 
 | 方法与路径 | 说明 |
 | --- | --- |
-| `POST /v1/deploy` | 提交部署请求，body 为 `{"service": "...", "tag": "..."}`，返回 202 和 `deploy_id` |
+| `POST /v1/deploy` | 提交部署请求，body 为 `{"service": "...", "tag": "..."}` 或 `{"service": "...", "digest": "sha256:..."}`，返回 202 和 `deploy_id`。未知字段、同时带 tag 和 digest 返回 400；body 超过 64 KiB 返回 413 |
 | `GET /v1/deploys/{id}` | 查询某次部署的结果，供客户端轮询 |
 | `GET /v1/status/{service}` | 查看某服务当前运行状态，供人工排查 |
 | `GET /v1/version` | 查询 agent 版本号，**唯一不需要证书的 `/v1/*` 接口**，见下文 |
 
 `GET /healthz` 单独监听在 `127.0.0.1:8867`，不需要证书。
 
-同样的 `/v1/*` 接口还额外监听在本机 unix socket `/var/lib/deploy-agent/agent.sock`（权限 0600，仅 root 可访问），不走 mTLS，供 `deploy-agent update`（见上文第 7 节）使用。
+所有监听都设置了连接限制：请求头（含 TLS 握手）必须在 10 秒内收完，整个请求 30 秒，响应 30 秒，空闲连接 60 秒后关闭，请求头最大 16 KiB，请求体最大 64 KiB（并且只能是一个 JSON 值，后面只允许空白，否则 400）。`:8866` 同时打开的连接数默认最多 64 个（`serve --max-conns` 调整），超出的连接在内核队列里等待空位，而不是各占一个 goroutine。这是全局上限而非按来源 IP：放在四层透传代理后面时，所有连接的来源地址都是代理。慢速连接无法长期占用资源，因此 `:8866` 可以放在四层透传之后对外暴露。
+
+同样的 `/v1/*` 接口还额外监听在本机 unix socket `/run/deploy-agent/deploy-agent.sock`（权限 0600，仅 root 可访问），不走 mTLS，供 `deploy-agent update`（见上文第 7 节）使用。
+
+- socket 所在目录由 systemd unit 中的 `RuntimeDirectory=deploy-agent`、`RuntimeDirectoryMode=0700` 创建。旧版本安装的 unit 文件没有这两行（`install.sh` 不会覆盖已有 unit），此时 serve 会自己以 0700 创建 `/run/deploy-agent`；也可以手动把这两行加进 `/etc/systemd/system/deploy-agent.service` 后 `systemctl daemon-reload`
+- serve 启动时检查 socket 的父目录：必须是真实目录（不接受符号链接）、属主为当前运行用户、并且 `mode & 0077 == 0`（组和其他用户没有任何权限），否则**拒绝启动**并给出原因。目录才是真正的访问边界，socket 本身的 0600 是第二层。agent 不修改进程 umask（umask 是进程级的，会影响其他 goroutine 写 sqlite 和 `.env`）
+- 使用非默认 `--data-dir` 的安装保持原来的 `<data-dir>/agent.sock`，也可以用 `serve --socket <path>` 显式指定；两种情况都同样检查父目录，例如 `<data-dir>` 必须是 0700（`install.sh` 创建的 `/var/lib/deploy-agent` 本来就是 0700）
+- 请求在 socket 上带有 `local` 身份，不受 `access` 绑定限制。所有访问检查默认拒绝：没有身份（既不是已登记证书，也不是本机 socket）的请求一律 403
 
 `GET /v1/version` 是一个特例：它与其他 `/v1/*` 接口共享同一个 `:8866` 端口，但不要求客户端证书，直接明文 HTTP 访问即可：
 
@@ -245,16 +327,17 @@ Agent 重启时会自动把上次未完成的部署标记为 `interrupted`，并
 
 ```bash
 sudo deploy-agent update -s web -t a1b2c3d
+sudo deploy-agent update -s web -d sha256:<64 位十六进制>   # image_ref: digest 的服务
 ```
 
 与流水线用的 `deploy-agent deploy` 相比，`update` 有两个不同点：
 
 - 不需要 `--endpoint`：请求默认发给本机正在运行的 `deploy-agent serve` 进程
-- 不需要 mTLS 凭据：走 serve 额外监听的本机 unix socket（`/var/lib/deploy-agent/agent.sock`，权限 0600），信任根是主机文件权限而非证书，因此必须以 root 执行（`sudo`），这与 `docker.sock` 访问权等价于 root 的定位一致
+- 不需要 mTLS 凭据：走 serve 额外监听的本机 unix socket（`/run/deploy-agent/deploy-agent.sock`，权限 0600，目录 0700），信任根是主机文件权限而非证书，因此必须以 root 执行（`sudo`），这与 `docker.sock` 访问权等价于 root 的定位一致。升级后 serve 还没重启时，`update` 会自动改用旧位置 `/var/lib/deploy-agent/agent.sock`
 
 `update` 复用与 `deploy` 相同的并发控制、幂等判断、失败自动回滚与退出码，输出格式也相同（见下文「Client 使用说明」第 4 节）；前提是 `deploy-agent serve` 正在运行，否则会报错并提示 `systemctl status deploy-agent`。
 
-如果 `serve` 使用了非默认数据目录，需要加上 `--data-dir`（用来定位 socket 文件）：
+如果 `serve` 使用了非默认数据目录，需要加上 `--data-dir`（用来定位 socket 文件）；`serve` 用 `--socket` 指定了路径时，`update` 也传同样的 `--socket`：
 
 ```bash
 sudo deploy-agent update -s web -t a1b2c3d --data-dir /custom/data-dir
@@ -337,7 +420,8 @@ export DEPLOY_AGENT_CREDENTIAL="<CI 密钥引用，内容为 ca issue 输出的�
 | --- | --- | --- | --- |
 | `--endpoint` | `-e` | 是 | Agent 地址，形如 `https://<vps-ip>:8866`。主机名也可以是服务端证书 SAN 里的域名 |
 | `--service` | `-s` | 是 | 逻辑服务名，须在目标机 `services.yaml` 白名单内 |
-| `--tag` | `-t` | 是 | 目标镜像 tag，格式 `^[A-Za-z0-9][A-Za-z0-9-]{0,127}$`。建议用不可变 tag（commit SHA、构建号），可变 tag 也能部署，但回滚与幂等判断都以 tag 为准 |
+| `--tag` | `-t` | 与 `--digest` 二选一 | 目标镜像 tag，格式 `^[A-Za-z0-9][A-Za-z0-9-]{0,127}$`。建议用不可变 tag（commit SHA、构建号），可变 tag 也能部署，但回滚与幂等判断都以 tag 为准 |
+| `--digest` | `-d` | 与 `--tag` 二选一 | 目标镜像 digest，格式 `^sha256:[a-f0-9]{64}$`，只用于清单中配置了 `image_ref: digest` 的服务 |
 | `--credential-env` | 无 | 否，默认 `DEPLOY_AGENT_CREDENTIAL` | 存放 PEM 证书包的环境变量名 |
 | `--poll-timeout` | 无 | 否，默认 `10m` | 提交重试与状态轮询的总时间预算 |
 
@@ -346,7 +430,7 @@ export DEPLOY_AGENT_CREDENTIAL="<CI 密钥引用，内容为 ca issue 输出的�
 - 提交后立即受理为异步任务，客户端自动轮询直到部署完成或超时
 - 同一服务同一 tag 重复提交会复用同一次部署（幂等），不会重复重启
 - 同一服务不同 tag 正在部署时返回冲突，客户端会在总超时内自动退避重试
-- 部署失败（`start_failed`）时 Agent 会自动尝试回滚，客户端只反映最终结果
+- 部署失败（`start_failed`、`post_deploy_failed`）时 Agent 会自动尝试回滚，客户端只反映最终结果
 
 ### 4. 输出与退出码
 
@@ -367,8 +451,8 @@ export DEPLOY_AGENT_CREDENTIAL="<CI 密钥引用，内容为 ca issue 输出的�
 | 退出码 | 含义 |
 | --- | --- |
 | `0` | 部署成功（`success` 或 `noop`） |
-| `1` | 部署失败（`pull_failed` / `config_invalid` / `start_failed` / `interrupted`） |
-| `2` | 参数错误或认证失败（凭据无效、证书未登记/已吊销、service 不在白名单等） |
+| `1` | 部署失败（`pull_failed` / `config_invalid` / `start_failed` / `post_deploy_failed` / `interrupted`） |
+| `2` | 参数错误或认证失败（凭据无效、证书未登记/已吊销/未绑定该服务、service 不在白名单等） |
 | `3` | 轮询总超时 |
 
 流水线应将脚本任务的非零退出码视为部署失败，禁止把失败降级为警告。
