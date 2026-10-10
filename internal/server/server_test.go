@@ -41,6 +41,7 @@ type testHarness struct {
 type harnessOptions struct {
 	manifest *config.Manifest
 	timeouts *serverTimeouts
+	maxConns int
 }
 
 func startHarness(t *testing.T) *testHarness {
@@ -80,6 +81,7 @@ func startHarnessWith(t *testing.T, opts harnessOptions) *testHarness {
 	if opts.timeouts != nil {
 		srv.timeouts = *opts.timeouts
 	}
+	srv.SetMaxConnections(opts.maxConns)
 
 	serverCert, err := tlsconf.LoadServerCertificate(mgr.ServerCertPath(), mgr.ServerKeyPath())
 	if err != nil {
@@ -333,7 +335,7 @@ func TestServer_LocalSocketDeployWithoutCert(t *testing.T) {
 	dep := deployer.New(manifest, dockerx.NewClient(), st)
 	srv := New(dep, st, "test")
 
-	socketPath := filepath.Join(t.TempDir(), "agent.sock")
+	socketPath := filepath.Join(privateTempDir(t), "agent.sock")
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	errCh := make(chan error, 1)

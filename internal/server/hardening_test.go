@@ -130,3 +130,81 @@ func assertErrorCode(t *testing.T, resp *http.Response, wantStatus int, wantCode
 		t.Fatalf("expected code %s, got %s (%s)", wantCode, errResp.Code, errResp.Message)
 	}
 }
+
+func TestServer_TrailingDataRejected(t *testing.T) {
+	h := startHarness(t)
+	client := h.httpClient(h.issueClient(t, "ci-lss-web"))
+
+	valid := `{"service":"svc","tag":"abc1234"}`
+	for _, body := range []string{
+		valid + valid,
+		valid + ` garbage`,
+		valid + `]`,
+		valid + `{"service":"svc","tag":"zzz9999"}`,
+	} {
+		resp, err := client.Post("https://"+h.addr+"/v1/deploy", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("POST /v1/deploy: %v", err)
+		}
+		assertErrorCode(t, resp, http.StatusBadRequest, api.ErrInvalidParam)
+		resp.Body.Close()
+	}
+
+	resp, err := client.Post("https://"+h.addr+"/v1/deploy", "application/json", strings.NewReader(valid+" \n\t\r\n"))
+	if err != nil {
+		t.Fatalf("POST /v1/deploy: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("trailing whitespace must be accepted, got %d", resp.StatusCode)
+	}
+}
+
+// TestServer_ConnectionCap fills every connection slot with idle
+// connections and checks that a further client is only served once a slot
+// is freed.
+func TestServer_ConnectionCap(t *testing.T) {
+	h := startHarnessWith(t, harnessOptions{maxConns: 2})
+
+	held := make([]net.Conn, 0, 2)
+	for range 2 {
+		conn, err := net.Dial("tcp", h.addr)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		t.Cleanup(func() { conn.Close() })
+		held = append(held, conn)
+	}
+
+	conn, err := net.Dial("tcp", h.addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_, err = conn.Write([]byte("GET /v1/version HTTP/1.1\r\nHost: agent\r\nConnection: close\r\n\r\n"))
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	buf := make([]byte, 64)
+	err = conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	_, err = conn.Read(buf)
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expected the third connection to wait for a slot, got err=%v", err)
+	}
+
+	held[0].Close()
+	err = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("expected a response once a slot was freed: %v", err)
+	}
+	if !strings.HasPrefix(string(buf[:n]), "HTTP/1.1 200") {
+		t.Fatalf("unexpected response %q", buf[:n])
+	}
+}

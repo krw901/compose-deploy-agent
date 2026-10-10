@@ -94,6 +94,10 @@ ExecStart=/usr/local/bin/deploy-agent serve --bind ${DEPLOY_AGENT_BIND} --manife
 EnvironmentFile=-/etc/deploy-agent/serve.env
 Restart=on-failure
 RestartSec=5
+# Private 0700 directory for the local unix socket used by
+# `deploy-agent update` (/run/deploy-agent/deploy-agent.sock).
+RuntimeDirectory=deploy-agent
+RuntimeDirectoryMode=0700
 # agent needs docker.sock and full compose-project directory access, both
 # equivalent to root on the host - it is not
 # sandboxed further.

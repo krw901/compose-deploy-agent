@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
@@ -93,19 +94,24 @@ func (server *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 
 // decodeDeployRequest parses a POST /v1/deploy body strictly: unknown
 // fields are rejected (the request can never smuggle in options such as a
-// post_deploy user or command), and exactly one of tag and digest must be
-// set. On failure it writes the error response and returns false.
+// post_deploy user or command), the body must hold exactly one JSON value
+// (only whitespace may follow it), and exactly one of tag and digest must
+// be set. On failure it writes the error response and returns false.
 func decodeDeployRequest(w http.ResponseWriter, r *http.Request) (api.DeployRequest, bool) {
 	var req api.DeployRequest
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	err := dec.Decode(&req)
 	if err != nil {
-		if _, tooLarge := errors.AsType[*http.MaxBytesError](err); tooLarge {
-			writeError(w, http.StatusRequestEntityTooLarge, api.ErrBodyTooLarge, "request body too large")
-			return req, false
+		writeBodyError(w, err)
+		return req, false
+	}
+	_, err = dec.Token()
+	if !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("unexpected data after JSON value")
 		}
-		writeError(w, http.StatusBadRequest, api.ErrInvalidParam, fmt.Sprintf("invalid JSON body: %v", err))
+		writeBodyError(w, err)
 		return req, false
 	}
 	if req.Service == "" || (req.Tag == "") == (req.Digest == "") {
@@ -114,6 +120,16 @@ func decodeDeployRequest(w http.ResponseWriter, r *http.Request) (api.DeployRequ
 		return req, false
 	}
 	return req, true
+}
+
+// writeBodyError maps a request body read/parse error to 413 (size limit)
+// or 400.
+func writeBodyError(w http.ResponseWriter, err error) {
+	if _, tooLarge := errors.AsType[*http.MaxBytesError](err); tooLarge {
+		writeError(w, http.StatusRequestEntityTooLarge, api.ErrBodyTooLarge, "request body too large")
+		return
+	}
+	writeError(w, http.StatusBadRequest, api.ErrInvalidParam, fmt.Sprintf("invalid JSON body: %v", err))
 }
 
 func (s *Server) writeStartDeployError(w http.ResponseWriter, err error) {

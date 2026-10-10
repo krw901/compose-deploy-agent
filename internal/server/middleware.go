@@ -15,11 +15,25 @@ import (
 // client certificate, set by fingerprintMiddleware.
 type clientIdentityKey struct{}
 
-// clientIdentity identifies the registered client certificate behind an
-// mTLS request. Requests from the local unix socket carry none.
+// clientIdentity identifies who sent a request: a registered client
+// certificate (mTLS) or, with local set, the local unix socket.
 type clientIdentity struct {
 	name        string
 	fingerprint string
+	local       bool
+}
+
+// localIdentityMiddleware marks every request on the unix socket listener
+// with the local identity. Access checks deny requests that carry no
+// identity at all, so this must wrap the router served on the socket.
+func localIdentityMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := clientIdentity{
+			name:  "local",
+			local: true,
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), clientIdentityKey{}, id)))
+	})
 }
 
 // limitBody caps every request body at maxRequestBodyBytes; reading past
