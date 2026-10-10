@@ -38,6 +38,63 @@ export DEPLOY_AGENT_CREDENTIAL="<CI 密钥引用，内容为 ca issue 输出的�
 | `--credential-env` | 无 | 否，默认 `DEPLOY_AGENT_CREDENTIAL` | 存放 PEM 证书包的环境变量名 |
 | `--poll-timeout` | 无 | 否，默认 `10m` | 提交重试与状态轮询的总时间预算 |
 
+OIDC 模式（不用证书，见下节）额外的参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--oidc-audience` | 向 GitHub Actions 申请该 audience 的 OIDC token（读取 `ACTIONS_ID_TOKEN_REQUEST_URL` / `ACTIONS_ID_TOKEN_REQUEST_TOKEN`，job 需要 `permissions: id-token: write`），并改连 agent 的 OIDC 入口 |
+| `--oidc-token-env` | 存放现成 OIDC token 的环境变量名，与 `--oidc-audience` 二选一 |
+| `--server-ca-file` | 服务端证书必须由这份 CA 签发，并且 SAN 包含 `--endpoint` 的主机名 |
+| `--server-cert-sha256` | 服务端证书 SHA-256 指纹锁定；与 `--server-ca-file` 至少配一个 |
+
+### OIDC 模式（GitHub Actions）
+
+agent 开启 OIDC 入口（见 [OIDC 认证](auth_oidc.md)）后，GitHub Actions 不需要保存客户端证书。客户端每次运行时申请 token，token 有效期只有几分钟，并且只能部署清单里绑定的服务。证书模式不受影响，`DEPLOY_AGENT_CREDENTIAL` 在 OIDC 模式下不使用。
+
+```yaml
+name: deploy-main
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write          # 申请 OIDC token 必需
+
+jobs:
+  # build: ...                   # 构建并推送镜像，outputs.digest 为镜像 digest（此处省略）
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: preview-main    # 与清单规则的 environment 一致
+    steps:
+      - name: Download deploy-agent client
+        env:
+          DEPLOY_AGENT_CLIENT_VERSION: "1.2.0"     # 固定版本，不要用 latest
+        run: |
+          curl --fail --location -o deploy-agent \
+            "https://github.com/krwu/compose-deploy-agent/releases/download/${DEPLOY_AGENT_CLIENT_VERSION}/deploy-agent"
+          chmod +x deploy-agent
+
+      - name: Deploy
+        env:
+          # agent 的 CA 证书（公开内容，不是私钥），也可以改用 --server-cert-sha256
+          DEPLOY_AGENT_SERVER_CA: ${{ vars.DEPLOY_AGENT_SERVER_CA }}
+        run: |
+          printf '%s\n' "$DEPLOY_AGENT_SERVER_CA" > agent-ca.pem
+          ./deploy-agent deploy \
+            -e "https://deploy-oidc.img.ntest.top" \
+            -s main \
+            -d "${{ needs.build.outputs.digest }}" \
+            --oidc-audience "https://deploy.img.ntest.top" \
+            --server-ca-file agent-ca.pem
+```
+
+- `--oidc-audience` 必须显式传入，并与清单 `oidc.audience` 完全一致；客户端不会使用 GitHub 默认 audience
+- 示例中的 `-d` 假设前面有一个输出镜像 digest 的 `build` job；tag 模式的服务改用 `-t`
+- 客户端缓存 token，到期前 1 分钟重新申请，所以轮询超过 token 有效期也没问题；`--oidc-token-env` 传入的固定 token 过期后轮询会失败
+- token 不会出现在客户端输出里。认证失败（401 `unauthenticated`）和绑定不匹配（403 `access_denied`）退出码都是 `2`，具体原因看 agent 日志
+
 ## 3. 行为说明
 
 - 提交后立即受理为异步任务，客户端自动轮询直到部署完成或超时
@@ -65,7 +122,7 @@ export DEPLOY_AGENT_CREDENTIAL="<CI 密钥引用，内容为 ca issue 输出的�
 | --- | --- |
 | `0` | 部署成功（`success` 或 `noop`） |
 | `1` | 部署失败（`pull_failed` / `config_invalid` / `start_failed` / `post_deploy_failed` / `interrupted`） |
-| `2` | 参数错误或认证失败（凭据无效、证书未登记/已吊销/未绑定该服务、service 不在白名单等） |
+| `2` | 参数错误或认证失败（凭据无效、证书未登记/已吊销/未绑定该服务、OIDC token 无效或未绑定该服务、service 不在白名单等） |
 | `3` | 轮询总超时 |
 
 流水线应将脚本任务的非零退出码视为部署失败，禁止把失败降级为警告。

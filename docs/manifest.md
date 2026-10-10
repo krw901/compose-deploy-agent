@@ -46,7 +46,7 @@ agent 拉取时使用 `docker compose pull --policy always`，因此即使始终
 
 手写清单时 `tag_env` 的默认值仍是 `IMAGE_TAG`，不受影响。
 
-向导重新生成清单时，下文的 `image_ref`、`post_deploy`、`access` 只对「原样保留」的服务和段落有效：被重新选中的已纳管服务会按扫描结果重建，`access` 段不会写回。使用这些字段的清单请手工维护，重新生成后务必核对。
+向导重新生成清单时，下文的 `image_ref`、`post_deploy`、`access`、`oidc` 只对「原样保留」的服务和段落有效：被重新选中的已纳管服务会按扫描结果重建，`access` 和顶层 `oidc` 段不会写回。使用这些字段的清单请手工维护，重新生成后务必核对。
 
 ### 只接受 digest（`image_ref: digest`，可选）
 
@@ -120,3 +120,31 @@ access:
 - `clients` 里引用了清单中不存在的服务、或 `services` 为空，清单加载失败
 - 没有配置 `access`、或 `require_binding` 为 false 时，`serve` 启动时和 `serve -t` 都会打印告警，提示存在可以部署所有服务的证书
 - 本机 unix socket（`deploy-agent update`）不受绑定限制，其信任根是主机 root 权限
+
+### GitHub Actions OIDC 绑定（`oidc`，可选）
+
+配合 `serve --oidc-listen` 使用，认证流程与安全设计见 [OIDC 认证](auth_oidc.md)。顶层 `oidc.audience` 是本 agent 专属的 audience，每个服务可以配一组 `oidc` 规则：
+
+```yaml
+oidc:
+  audience: https://deploy.img.ntest.top   # 必须与 workflow 里申请 token 时的 audience 一致
+
+services:
+  main:
+    # dir / file / service / image ...
+    oidc:
+      - repository_id: "123456789"         # 必填，仓库数字 ID
+        repository_owner_id: "987654321"   # 必填，owner 数字 ID
+        repository: kairee/img-webdn       # 可选，只作二次校验
+        ref: refs/heads/main               # 必填，完整 ref，精确匹配
+        event_name: [push]                 # 必填，允许的事件白名单
+        environment: preview-main          # 可选，配置了就必须一致
+        job_workflow_ref: kairee/img-webdn/.github/workflows/deploy.yml@refs/heads/main   # 可选
+```
+
+- 一个服务的多条规则之间是「或」，一条规则内所有已配置的字段是「且」；每个 claim 单独比较，不使用 `sub`
+- `repository_id`、`repository_owner_id` 必须是数字（加不加引号都可以），用 `gh api repos/<owner>/<repo> --jq '.id,.owner.id'` 查询
+- `event_name` 不能包含 `pull_request_target`、`workflow_run`，否则清单加载失败；运行时也会无条件拒绝这两种事件
+- 有服务配置了 `oidc` 规则时 `oidc.audience` 必填；audience 不能是 GitHub 默认的 `https://github.com/<owner>`
+- 规则既没有 `environment` 也没有 `job_workflow_ref` 时，`serve` 和 `serve -t` 会告警：同一仓库在该 ref 上的任何 workflow 都能部署这个服务。建议至少配置其中一个，`environment` 还可以在 GitHub 上加审批和分支保护
+- 没有 `oidc` 规则的服务不接受 OIDC token；`oidc` 规则不影响证书入口和 `access`

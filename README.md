@@ -7,7 +7,7 @@ Compose 服务镜像自动更新 agent：CI 流水线镜像推送完成后，自
 - **Agent（`serve` / `ca`）**：部署在目标 VPS 上的常驻服务，由 systemd 托管。
 - **Client（`deploy`）**：部署在 CI 流水线脚本任务中，用来提交部署请求。
 
-两者通过 mTLS 通信，身份由本机自签的证书体系承载，不使用 token。
+两者默认通过 mTLS 通信，身份由本机自签的证书体系承载；也可以另开一个入口，接受 GitHub Actions 的 OIDC token（见 [OIDC 认证](docs/auth_oidc.md)）。
 
 ## 目录结构
 
@@ -39,6 +39,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
 
 - 单一 Go 静态二进制，子命令区分 Agent（`serve` / `ca` / `setup` / `update` / `self-*`）与 Client（`deploy`）
 - 每机自签 CA 的 mTLS 认证，证书可单独吊销，可按证书绑定可部署的服务（`access`）
+- 可选的 GitHub Actions OIDC 认证：独立入口、免长期凭据，按仓库/owner 数字 ID、ref、事件、environment、workflow 绑定服务，jti 防重放
 - 清单即白名单：只有 `services.yaml` 里的服务可以部署，请求无法注入任何执行参数
 - 部署失败（拉取、预检、就绪、`post_deploy`）自动回滚到上一个健康版本，同 tag 重复提交幂等
 - 可选只接受镜像 digest（`image_ref: digest`）和部署后固定命令（`post_deploy`）
@@ -73,9 +74,10 @@ export DEPLOY_AGENT_CREDENTIAL="<CI 密钥引用，内容为 ca issue 输出的�
 | 文档 | 内容 |
 | --- | --- |
 | [docs/agent_install.md](docs/agent_install.md) | 安装、安装向导、systemd、日常运维、`update`、`self-upgrade`、数据目录与 socket 目录权限 |
-| [docs/manifest.md](docs/manifest.md) | `services.yaml` 全部字段：基础字段、向导生成、`image_ref: digest`、`post_deploy`、`access` |
+| [docs/manifest.md](docs/manifest.md) | `services.yaml` 全部字段：基础字段、向导生成、`image_ref: digest`、`post_deploy`、`access`、`oidc` |
 | [docs/auth_mtls.md](docs/auth_mtls.md) | 本机 CA、客户端证书签发、吊销与服务端证书重签 |
-| [docs/client.md](docs/client.md) | 在 CI 中调用 `deploy-agent deploy`、参数、行为与退出码 |
+| [docs/auth_oidc.md](docs/auth_oidc.md) | GitHub Actions OIDC 认证：独立入口、token 校验、绑定规则、防重放、客户端锁定服务端证书 |
+| [docs/client.md](docs/client.md) | 在 CI 中调用 `deploy-agent deploy`、参数、行为与退出码、GitHub Actions OIDC workflow 示例 |
 | [docs/api.md](docs/api.md) | Agent HTTP 接口、连接限制、`/v1/version` |
 
 ## 参与开发
