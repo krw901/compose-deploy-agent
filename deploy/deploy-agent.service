@@ -1,0 +1,19 @@
+[Unit]
+Description=deploy-agent - compose service auto-update agent
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/deploy-agent serve --bind ${DEPLOY_AGENT_BIND} --manifest /etc/deploy-agent/services.yaml --data-dir /var/lib/deploy-agent
+EnvironmentFile=-/etc/deploy-agent/serve.env
+Restart=on-failure
+RestartSec=5
+# agent needs docker.sock and full compose-project directory access, both
+# equivalent to root on the host - it is not
+# sandboxed further.
+User=root
+
+[Install]
+WantedBy=multi-user.target

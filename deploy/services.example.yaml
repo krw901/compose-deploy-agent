@@ -1,0 +1,20 @@
+# Example services.yaml. Each entry needs exactly four required fields;
+# tag_env is optional and defaults to IMAGE_TAG.
+#
+# The referenced compose file's service must inject the tag via
+# ${IMAGE_TAG:?} (or whatever tag_env is set to) so a missing variable
+# fails loudly instead of silently deploying an empty tag:
+#
+#   services:
+#     web:
+#       image: registry.example.com/web:${IMAGE_TAG:?IMAGE_TAG is required}
+#
+version: 1
+
+services:
+  web:
+    dir: /srv/web
+    file: compose.yml
+    service: web
+    image: registry.example.com/web
+    # tag_env: IMAGE_TAG
