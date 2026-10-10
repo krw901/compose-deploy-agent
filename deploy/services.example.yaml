@@ -18,3 +18,29 @@ services:
     service: web
     image: registry.example.com/web
     # tag_env: IMAGE_TAG
+
+  # Digest-only service with a fixed post-deploy command. Its compose file
+  # must reference the image as
+  #   image: ghcr.io/example/app@${IMAGE_DIGEST:?IMAGE_DIGEST is required}
+  # and deploy requests must carry --digest sha256:<64 hex>; tags are refused.
+  # app:
+  #   dir: /srv/app
+  #   file: compose.yml
+  #   service: app
+  #   image: ghcr.io/example/app
+  #   image_ref: digest          # default: tag
+  #   tag_env: IMAGE_DIGEST
+  #   post_deploy:               # runs after readiness; failure => rollback
+  #     user: www-data           # required; root / 0 / root:* / *:0 are refused
+  #     args: [php, artisan, "lsky:preview-init"]
+  #     # service: app           # default: this entry's compose service
+  #     # timeout: 3m            # default 3m, max 5m
+
+# Optional: bind client certificates (by `ca issue -n` name or `ca list`
+# fingerprint) to the services they may deploy. Without this section every
+# registered certificate may deploy every service (a warning is logged).
+# access:
+#   require_binding: true        # unlisted certificates get 403
+#   clients:
+#     ci-web:
+#       services: [web]
