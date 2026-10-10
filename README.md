@@ -285,9 +285,14 @@ curl http://127.0.0.1:8867/healthz
 
 `GET /healthz` 单独监听在 `127.0.0.1:8867`，不需要证书。
 
-所有监听都设置了连接限制：请求头（含 TLS 握手）必须在 10 秒内收完，整个请求 30 秒，响应 30 秒，空闲连接 60 秒后关闭，请求头最大 16 KiB，请求体最大 64 KiB。慢速连接无法长期占用资源，因此 `:8866` 可以放在四层透传之后对外暴露。
+所有监听都设置了连接限制：请求头（含 TLS 握手）必须在 10 秒内收完，整个请求 30 秒，响应 30 秒，空闲连接 60 秒后关闭，请求头最大 16 KiB，请求体最大 64 KiB（并且只能是一个 JSON 值，后面只允许空白，否则 400）。`:8866` 同时打开的连接数默认最多 64 个（`serve --max-conns` 调整），超出的连接在内核队列里等待空位，而不是各占一个 goroutine。这是全局上限而非按来源 IP：放在四层透传代理后面时，所有连接的来源地址都是代理。慢速连接无法长期占用资源，因此 `:8866` 可以放在四层透传之后对外暴露。
 
-同样的 `/v1/*` 接口还额外监听在本机 unix socket `/var/lib/deploy-agent/agent.sock`（权限 0600，仅 root 可访问），不走 mTLS，供 `deploy-agent update`（见上文第 7 节）使用。
+同样的 `/v1/*` 接口还额外监听在本机 unix socket `/run/deploy-agent/deploy-agent.sock`（权限 0600，仅 root 可访问），不走 mTLS，供 `deploy-agent update`（见上文第 7 节）使用。
+
+- socket 所在目录由 systemd unit 中的 `RuntimeDirectory=deploy-agent`、`RuntimeDirectoryMode=0700` 创建。旧版本安装的 unit 文件没有这两行（`install.sh` 不会覆盖已有 unit），此时 serve 会自己以 0700 创建 `/run/deploy-agent`；也可以手动把这两行加进 `/etc/systemd/system/deploy-agent.service` 后 `systemctl daemon-reload`
+- serve 启动时检查 socket 的父目录：必须是真实目录（不接受符号链接）、属主为当前运行用户、并且 `mode & 0077 == 0`（组和其他用户没有任何权限），否则**拒绝启动**并给出原因。目录才是真正的访问边界，socket 本身的 0600 是第二层。agent 不修改进程 umask（umask 是进程级的，会影响其他 goroutine 写 sqlite 和 `.env`）
+- 使用非默认 `--data-dir` 的安装保持原来的 `<data-dir>/agent.sock`，也可以用 `serve --socket <path>` 显式指定；两种情况都同样检查父目录，例如 `<data-dir>` 必须是 0700（`install.sh` 创建的 `/var/lib/deploy-agent` 本来就是 0700）
+- 请求在 socket 上带有 `local` 身份，不受 `access` 绑定限制。所有访问检查默认拒绝：没有身份（既不是已登记证书，也不是本机 socket）的请求一律 403
 
 `GET /v1/version` 是一个特例：它与其他 `/v1/*` 接口共享同一个 `:8866` 端口，但不要求客户端证书，直接明文 HTTP 访问即可：
 
@@ -328,11 +333,11 @@ sudo deploy-agent update -s web -d sha256:<64 位十六进制>   # image_ref: di
 与流水线用的 `deploy-agent deploy` 相比，`update` 有两个不同点：
 
 - 不需要 `--endpoint`：请求默认发给本机正在运行的 `deploy-agent serve` 进程
-- 不需要 mTLS 凭据：走 serve 额外监听的本机 unix socket（`/var/lib/deploy-agent/agent.sock`，权限 0600），信任根是主机文件权限而非证书，因此必须以 root 执行（`sudo`），这与 `docker.sock` 访问权等价于 root 的定位一致
+- 不需要 mTLS 凭据：走 serve 额外监听的本机 unix socket（`/run/deploy-agent/deploy-agent.sock`，权限 0600，目录 0700），信任根是主机文件权限而非证书，因此必须以 root 执行（`sudo`），这与 `docker.sock` 访问权等价于 root 的定位一致。升级后 serve 还没重启时，`update` 会自动改用旧位置 `/var/lib/deploy-agent/agent.sock`
 
 `update` 复用与 `deploy` 相同的并发控制、幂等判断、失败自动回滚与退出码，输出格式也相同（见下文「Client 使用说明」第 4 节）；前提是 `deploy-agent serve` 正在运行，否则会报错并提示 `systemctl status deploy-agent`。
 
-如果 `serve` 使用了非默认数据目录，需要加上 `--data-dir`（用来定位 socket 文件）：
+如果 `serve` 使用了非默认数据目录，需要加上 `--data-dir`（用来定位 socket 文件）；`serve` 用 `--socket` 指定了路径时，`update` 也传同样的 `--socket`：
 
 ```bash
 sudo deploy-agent update -s web -t a1b2c3d --data-dir /custom/data-dir
