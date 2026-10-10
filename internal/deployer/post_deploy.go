@@ -12,7 +12,8 @@ import (
 )
 
 // postDeployOutputLimit caps how much command stderr is kept in the deploy
-// record message.
+// record message and log. Only the stderr tail is kept; stdout, the exec
+// environment and anything beyond the manifest args are never recorded.
 const postDeployOutputLimit = 512
 
 // errPostDeployTimeout is the cancellation cause when post_deploy.timeout
@@ -63,11 +64,12 @@ func (deployer *Deployer) runPostDeploy(ctx context.Context, log *slog.Logger, s
 	return failure
 }
 
-// tailOutput keeps the last postDeployOutputLimit bytes of s, trimmed.
+// tailOutput keeps at most the last postDeployOutputLimit bytes of s,
+// trimmed, dropping any UTF-8 sequence split by the cut.
 func tailOutput(s string) string {
 	s = strings.TrimSpace(s)
 	if len(s) > postDeployOutputLimit {
-		s = "..." + s[len(s)-postDeployOutputLimit:]
+		s = "..." + strings.ToValidUTF8(s[len(s)-postDeployOutputLimit:], "")
 	}
 	return s
 }

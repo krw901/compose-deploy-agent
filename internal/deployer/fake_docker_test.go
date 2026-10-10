@@ -1,6 +1,7 @@
 package deployer
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -70,6 +71,12 @@ type fakeRunner struct {
 	// execHang makes `compose exec` block until its context is done,
 	// simulating a command that never finishes.
 	execHang bool
+	// execStdout and execStderr, if set, replace the scripted output of
+	// a failing `compose exec`.
+	execStdout string
+	execStderr string
+	// execEnv records the extra environment passed to every `compose exec`.
+	execEnv [][]string
 }
 
 // execOutcome is the scripted result of a `compose exec` call.
@@ -113,13 +120,15 @@ func (f *fakeRunner) recordedExecArgs() [][]string {
 
 // runExec simulates `docker compose -f <file> exec ...` without holding the
 // runner lock while it blocks, so a hanging exec only ends via ctx.
-func (f *fakeRunner) runExec(ctx context.Context, argv []string) (dockerx.Output, error) {
+func (f *fakeRunner) runExec(ctx context.Context, extraEnv, argv []string) (dockerx.Output, error) {
 	f.mu.Lock()
 	f.execArgs = append(f.execArgs, slices.Clone(argv))
+	f.execEnv = append(f.execEnv, slices.Clone(extraEnv))
 	outcome := execOutcome{
 		exitCode: f.execExitCode,
 		hang:     f.execHang,
 	}
+	stdout, stderr := f.execStdout, cmp.Or(f.execStderr, "preview-init failed")
 	f.mu.Unlock()
 
 	if outcome.hang {
@@ -128,7 +137,7 @@ func (f *fakeRunner) runExec(ctx context.Context, argv []string) (dockerx.Output
 	}
 	if outcome.exitCode != 0 {
 		err := fmt.Errorf("exit status %d", outcome.exitCode)
-		return dockerx.Output{ExitCode: outcome.exitCode, Stderr: "preview-init failed"}, err
+		return dockerx.Output{ExitCode: outcome.exitCode, Stdout: stdout, Stderr: stderr}, err
 	}
 	return dockerx.Output{Stdout: "ok"}, nil
 }
@@ -151,7 +160,7 @@ func (f *fakeRunner) currentRunning() (tag, imageID string) {
 
 func (runner *fakeRunner) Run(ctx context.Context, dir string, extraEnv []string, name string, args ...string) (dockerx.Output, error) {
 	if isComposeExec(name, args) {
-		return runner.runExec(ctx, args)
+		return runner.runExec(ctx, extraEnv, args)
 	}
 	runner.mu.Lock()
 	defer runner.mu.Unlock()
