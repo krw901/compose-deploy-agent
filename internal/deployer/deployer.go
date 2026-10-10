@@ -118,11 +118,27 @@ func (d *Deployer) SetTimingForTest(total, readinessWindow, readinessInterval, s
 // and whether an existing in-flight deploy was
 // reused rather than a new one started.
 func (deployer *Deployer) StartDeploy(ctx context.Context, service, tag string) (deployID string, reused bool, err error) {
+	return deployer.startDeploy(ctx, service, tag, false)
+}
+
+// StartDeployDigest is StartDeploy for services configured with
+// image_ref: digest; digest must be "sha256:<64 hex>".
+func (deployer *Deployer) StartDeployDigest(ctx context.Context, service, digest string) (string, bool, error) {
+	return deployer.startDeploy(ctx, service, digest, true)
+}
+
+// Manifest returns the manifest the deployer was built with.
+func (deployer *Deployer) Manifest() *config.Manifest {
+	return deployer.manifest
+}
+
+func (deployer *Deployer) startDeploy(ctx context.Context, service, tag string, isDigest bool) (string, bool, error) {
 	svc, ok := deployer.manifest.Lookup(service)
 	if !ok {
 		return "", false, ErrServiceNotFound{Service: service}
 	}
-	if err := tagfmt.Validate(tag); err != nil {
+	err := validateRequestedRef(service, svc, tag, isDigest)
+	if err != nil {
 		return "", false, ErrInvalidTag{Reason: err}
 	}
 
@@ -186,6 +202,28 @@ func (deployer *Deployer) StartDeploy(ctx context.Context, service, tag string) 
 // any requests.
 func (d *Deployer) MarkInterruptedOnStartup() (int, error) {
 	return d.store.MarkInterrupted(time.Now())
+}
+
+// validateRequestedRef checks that the request carries the reference kind
+// the service is configured for, in the strict format for that kind. A
+// digest-only service never accepts a tag (tags can be re-pointed), and a
+// tag service never accepts a digest (its compose file uses "repo:${VAR}").
+func validateRequestedRef(service string, svc config.Service, ref string, isDigest bool) error {
+	if svc.UsesDigest() != isDigest {
+		if svc.UsesDigest() {
+			return fmt.Errorf("service %q only accepts image digests (image_ref: digest), not tags", service)
+		}
+		return fmt.Errorf("service %q deploys by tag; digest is only accepted with image_ref: digest", service)
+	}
+	return validRefForService(svc, ref)
+}
+
+// validRefForService validates ref against svc's image_ref mode.
+func validRefForService(svc config.Service, ref string) error {
+	if svc.UsesDigest() {
+		return tagfmt.ValidateDigest(ref)
+	}
+	return tagfmt.Validate(ref)
 }
 
 func newDeployID() (string, error) {

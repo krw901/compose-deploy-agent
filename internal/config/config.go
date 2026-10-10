@@ -35,6 +35,13 @@ type Service struct {
 	// both as a process env var during pull/config precheck and as a
 	// line written into Dir/.env before `up`. Defaults to IMAGE_TAG.
 	TagEnv string `yaml:"tag_env"`
+	// ImageRef selects how the deployed version is referenced: "tag"
+	// (default, compose uses image:${TAG_ENV}) or "digest" (compose uses
+	// image@${TAG_ENV}, and only sha256 digests are accepted).
+	ImageRef ImageRefMode `yaml:"image_ref,omitempty"`
+	// PostDeploy, if set, is a fixed command run inside the container after
+	// the new version passes readiness. A failure rolls the deploy back.
+	PostDeploy *PostDeploy `yaml:"post_deploy,omitempty"`
 }
 
 // ComposeFile returns the absolute path to the compose file.
@@ -60,6 +67,10 @@ func (s Service) EffectiveTagEnv() string {
 type Manifest struct {
 	Version  int                `yaml:"version"`
 	Services map[string]Service `yaml:"services"`
+	// Access optionally restricts which client certificates may act on
+	// which services. Nil keeps the historical behavior: any registered,
+	// non-revoked certificate may deploy any service.
+	Access *Access `yaml:"access,omitempty"`
 }
 
 // Lookup returns the service entry for name, and whether it exists. This is
@@ -104,11 +115,10 @@ func Parse(data []byte) (*Manifest, error) {
 
 	for _, name := range names {
 		svc := m.Services[name]
-		if svc.TagEnv == "" {
-			svc.TagEnv = DefaultTagEnv
-			m.Services[name] = svc
-		}
-		if err := validateService(name, svc); err != nil {
+		svc = applyServiceDefaults(svc)
+		m.Services[name] = svc
+		err := validateService(name, svc)
+		if err != nil {
 			return nil, err
 		}
 
@@ -126,7 +136,29 @@ func Parse(data []byte) (*Manifest, error) {
 		dirComposeService[svc.Dir][svc.ComposeService] = name
 	}
 
+	err := m.validateAccess()
+	if err != nil {
+		return nil, err
+	}
 	return &m, nil
+}
+
+// applyServiceDefaults fills in the optional fields Parse defaults.
+func applyServiceDefaults(svc Service) Service {
+	if svc.TagEnv == "" {
+		svc.TagEnv = DefaultTagEnv
+	}
+	if svc.PostDeploy != nil {
+		pd := *svc.PostDeploy
+		if pd.Service == "" {
+			pd.Service = svc.ComposeService
+		}
+		if pd.Timeout == 0 {
+			pd.Timeout = DefaultPostDeployTimeout
+		}
+		svc.PostDeploy = &pd
+	}
+	return svc
 }
 
 func validateService(name string, svc Service) error {
@@ -147,6 +179,17 @@ func validateService(name string, svc Service) error {
 	}
 	if !tagEnvPattern.MatchString(svc.TagEnv) {
 		return fmt.Errorf("service %q: tag_env %q is not a valid environment variable name", name, svc.TagEnv)
+	}
+	switch svc.ImageRef {
+	case "", ImageRefTag, ImageRefDigest:
+	default:
+		return fmt.Errorf("service %q: image_ref %q must be %q or %q", name, svc.ImageRef, ImageRefTag, ImageRefDigest)
+	}
+	if svc.PostDeploy != nil {
+		err := validatePostDeploy(*svc.PostDeploy)
+		if err != nil {
+			return fmt.Errorf("service %q: post_deploy: %w", name, err)
+		}
 	}
 	return nil
 }

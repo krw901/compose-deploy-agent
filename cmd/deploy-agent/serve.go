@@ -54,6 +54,7 @@ func runServe(args []string) error {
 		}
 		fmt.Printf("deploy-agent: configuration test is successful (%d services, server certificate valid until %s)\n",
 			len(cfg.manifest.Services), notAfter.Format(time.DateTime))
+		printAccessWarnings(cfg.manifest)
 		return nil
 	}
 
@@ -78,6 +79,7 @@ func runServe(args []string) error {
 		slog.Warn("marked in-progress deploys as interrupted after restart", "count", n)
 	}
 
+	logAccessWarnings(cfg.manifest)
 	runReverseCalibration(context.Background(), dep, cfg.manifest)
 	logExpiringCerts(st)
 
@@ -86,18 +88,7 @@ func runServe(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	go func() {
-		ticker := time.NewTicker(expiryCheckInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				logExpiringCerts(st)
-			}
-		}
-	}()
+	go checkExpiringCertsDaily(ctx, st)
 
 	socketPath := paths.SocketPath(*dataDir)
 	errCh := make(chan error, 3)
@@ -135,6 +126,36 @@ func runReverseCalibration(ctx context.Context, dep *deployer.Deployer, manifest
 			slog.Warn("reverse calibration: last_healthy image differs from running image",
 				"service", name, "last_healthy_image_id", status.LastHealthy.ImageID, "running_image_id", status.Running.ImageID)
 		}
+	}
+}
+
+// checkExpiringCertsDaily re-runs logExpiringCerts every
+// expiryCheckInterval until ctx is done.
+func checkExpiringCertsDaily(ctx context.Context, st *store.Store) {
+	ticker := time.NewTicker(expiryCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			logExpiringCerts(st)
+		}
+	}
+}
+
+// logAccessWarnings logs every services.yaml access configuration under
+// which some client certificate may deploy every service.
+func logAccessWarnings(manifest *config.Manifest) {
+	for _, warning := range manifest.AccessWarnings() {
+		slog.Warn("client certificate access is not restricted", "detail", warning)
+	}
+}
+
+// printAccessWarnings is logAccessWarnings for `serve -t`.
+func printAccessWarnings(manifest *config.Manifest) {
+	for _, warning := range manifest.AccessWarnings() {
+		fmt.Fprintf(os.Stderr, "deploy-agent: warning: %s\n", warning)
 	}
 }
 

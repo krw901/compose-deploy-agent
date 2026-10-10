@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -9,6 +10,26 @@ import (
 	"github.com/krwu/compose-deploy-agent/internal/credential"
 	"github.com/krwu/compose-deploy-agent/internal/store"
 )
+
+// clientIdentityKey is the request context key for the authenticated
+// client certificate, set by fingerprintMiddleware.
+type clientIdentityKey struct{}
+
+// clientIdentity identifies the registered client certificate behind an
+// mTLS request. Requests from the local unix socket carry none.
+type clientIdentity struct {
+	name        string
+	fingerprint string
+}
+
+// limitBody caps every request body at maxRequestBodyBytes; reading past
+// the limit fails with *http.MaxBytesError.
+func limitBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
+		next.ServeHTTP(w, r)
+	})
+}
 
 // fingerprintMiddleware runs after the TLS handshake has already verified
 // the certificate chain and expiry (tls.RequireAndVerifyClientCert in
@@ -43,7 +64,11 @@ func fingerprintMiddleware(s *store.Store) func(http.Handler) http.Handler {
 				return
 			}
 
-			next.ServeHTTP(w, r)
+			id := clientIdentity{
+				name:        rec.Name,
+				fingerprint: fingerprint,
+			}
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), clientIdentityKey{}, id)))
 		})
 	}
 }

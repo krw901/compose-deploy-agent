@@ -19,13 +19,18 @@ func runDeploy(args []string) error {
 	endpoint := stringFlag(fs, "endpoint", "e", "", "agent endpoint, e.g. https://10.0.0.5:8866")
 	service := stringFlag(fs, "service", "s", "", "logical service name (must match services.yaml)")
 	tag := stringFlag(fs, "tag", "t", "", "target image tag")
+	digest := stringFlag(fs, "digest", "d", "", "target image digest sha256:<64 hex> (services with image_ref: digest)")
 	credentialEnv := fs.String("credential-env", defaultCredentialEnv, "environment variable holding the PEM credential bundle")
 	pollTimeout := fs.Duration("poll-timeout", client.DefaultPollTimeout, "total time budget for submit retries and status polling")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *endpoint == "" || *service == "" || *tag == "" {
-		return fmt.Errorf("--endpoint, --service and --tag are all required")
+	if *endpoint == "" || *service == "" {
+		return fmt.Errorf("--endpoint and --service are required")
+	}
+	err := requireOneRef(*tag, *digest)
+	if err != nil {
+		return err
 	}
 
 	credentialPEM := os.Getenv(*credentialEnv)
@@ -37,11 +42,20 @@ func runDeploy(args []string) error {
 		Endpoint:      *endpoint,
 		Service:       *service,
 		Tag:           *tag,
+		Digest:        *digest,
 		CredentialPEM: []byte(credentialPEM),
 		PollTimeout:   *pollTimeout,
 	})
 
 	return emitSummary(summary)
+}
+
+// requireOneRef checks that exactly one of --tag and --digest was given.
+func requireOneRef(tag, digest string) error {
+	if (tag == "") == (digest == "") {
+		return fmt.Errorf("exactly one of --tag or --digest is required")
+	}
+	return nil
 }
 
 // emitSummary prints summary as indented JSON to stdout and, if the deploy

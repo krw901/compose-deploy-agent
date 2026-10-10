@@ -36,7 +36,19 @@ type testHarness struct {
 	errCh  chan error
 }
 
+// harnessOptions customizes startHarnessWith. Zero values keep the
+// defaults used by startHarness.
+type harnessOptions struct {
+	manifest *config.Manifest
+	timeouts *serverTimeouts
+}
+
 func startHarness(t *testing.T) *testHarness {
+	t.Helper()
+	return startHarnessWith(t, harnessOptions{})
+}
+
+func startHarnessWith(t *testing.T, opts harnessOptions) *testHarness {
 	t.Helper()
 
 	dataDir := t.TempDir()
@@ -60,8 +72,14 @@ func startHarness(t *testing.T) *testHarness {
 			TagEnv:         "IMAGE_TAG",
 		},
 	}}
+	if opts.manifest != nil {
+		manifest = opts.manifest
+	}
 	dep := deployer.New(manifest, dockerx.NewClient(), st)
 	srv := New(dep, st, "test")
+	if opts.timeouts != nil {
+		srv.timeouts = *opts.timeouts
+	}
 
 	serverCert, err := tlsconf.LoadServerCertificate(mgr.ServerCertPath(), mgr.ServerKeyPath())
 	if err != nil {

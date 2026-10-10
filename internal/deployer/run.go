@@ -32,7 +32,7 @@ func (deployer *Deployer) run(ctx context.Context, service string, svc config.Se
 	}
 	deployer.seedLastHealthy(log, service, snapshot)
 
-	expectedImage := svc.Image + ":" + targetTag
+	expectedImage := svc.ImageReference(targetTag)
 	if err := deployer.preflight(ctx, svc, expectedImage, targetTag); err != nil {
 		deployer.finish(deployID, deployOutcome(api.ResultConfigInvalid, api.RollbackNone, "", "", err.Error()))
 		return
@@ -55,7 +55,8 @@ func (deployer *Deployer) run(ctx context.Context, service string, svc config.Se
 	// resolved image reference changes, even if both tags share an image ID.
 	if snapshot.Present && snapshot.Tag == targetTag && targetImageID == snapshot.ImageID {
 		// No-op: still make sure .env reflects reality for anyone
-		// operating on this directory by hand later.
+		// operating on this directory by hand later. post_deploy is not
+		// run: nothing changed.
 		if err := dotenv.SetLine(svc.EnvFile(), svc.EffectiveTagEnv(), targetTag); err != nil {
 			log.Error("noop .env correction failed", "error", err)
 		}
@@ -69,30 +70,46 @@ func (deployer *Deployer) run(ctx context.Context, service string, svc config.Se
 		return
 	}
 
-	upErr := deployer.docker.Up(ctx, svc.Dir, svc.File, svc.ComposeService)
-	ready := upErr == nil && deployer.waitReady(ctx, svc, targetImageID)
-	if upErr == nil && ready {
-		if err := deployer.store.SetLastHealthy(service, targetTag, targetImageID, time.Now()); err != nil {
-			log.Error("update last_healthy failed", "error", err)
-		}
-		deployer.finish(deployID, deployOutcome(api.ResultSuccess, api.RollbackNone, targetImageID, "", ""))
-		return
-	}
-
-	upMsg := ""
-	if upErr != nil {
-		upMsg = fmt.Sprintf("up failed: %v; ", upErr)
-	} else {
-		upMsg = "readiness check timed out; "
-	}
-	deployer.attemptRollback(ctx, log, rollbackInput{
+	deployer.activate(ctx, log, rollbackInput{
 		service:       service,
 		svc:           svc,
 		deployID:      deployID,
 		snapshot:      snapshot,
 		targetImageID: targetImageID,
-		msgPrefix:     upMsg,
-	})
+	}, targetTag)
+}
+
+// activate starts the already-written target version, waits for readiness,
+// runs the fixed post_deploy command, and either records success or rolls
+// back. A failed or timed-out post_deploy is a deploy failure
+// (post_deploy_failed) and rolls back exactly like a failed readiness check.
+func (deployer *Deployer) activate(ctx context.Context, log *slog.Logger, in rollbackInput, targetTag string) {
+	upErr := deployer.docker.Up(ctx, in.svc.Dir, in.svc.File, in.svc.ComposeService)
+	if upErr != nil {
+		in.result = api.ResultStartFailed
+		in.msgPrefix = fmt.Sprintf("up failed: %v; ", upErr)
+		deployer.attemptRollback(ctx, log, in)
+		return
+	}
+	if !deployer.waitReady(ctx, in.svc, in.targetImageID) {
+		in.result = api.ResultStartFailed
+		in.msgPrefix = "readiness check timed out; "
+		deployer.attemptRollback(ctx, log, in)
+		return
+	}
+	postDeployFailure := deployer.runPostDeploy(ctx, log, in.svc)
+	if postDeployFailure != "" {
+		in.result = api.ResultPostDeployFailed
+		in.msgPrefix = postDeployFailure + "; "
+		deployer.attemptRollback(ctx, log, in)
+		return
+	}
+
+	err := deployer.store.SetLastHealthy(in.service, targetTag, in.targetImageID, time.Now())
+	if err != nil {
+		log.Error("update last_healthy failed", "error", err)
+	}
+	deployer.finish(in.deployID, deployOutcome(api.ResultSuccess, api.RollbackNone, in.targetImageID, "", ""))
 }
 
 // seedLastHealthy records the current healthy version the first time a
@@ -141,7 +158,9 @@ type rollbackInput struct {
 	deployID      string
 	snapshot      runningSnapshot
 	targetImageID string
-	msgPrefix     string
+	// result is the failure reported whether or not the rollback works.
+	result    api.Result
+	msgPrefix string
 }
 
 func (deployer *Deployer) attemptRollback(ctx context.Context, log *slog.Logger, in rollbackInput) {
@@ -153,23 +172,33 @@ func (deployer *Deployer) attemptRollback(ctx context.Context, log *slog.Logger,
 	}
 	target := chooseRollbackTarget(in.snapshot, lastHealthy)
 	if !target.Available {
-		deployer.finish(in.deployID, deployOutcome(api.ResultStartFailed, api.RollbackNone, in.targetImageID, "",
+		deployer.finish(in.deployID, deployOutcome(in.result, api.RollbackNone, in.targetImageID, "",
 			in.msgPrefix+"no rollback target available"))
 		return
 	}
+	// A target recorded before the service switched image_ref mode (a tag
+	// for a digest-only service, or vice versa) cannot be written into the
+	// compose reference safely.
+	err = validRefForService(in.svc, target.Tag)
+	if err != nil {
+		deployer.finish(in.deployID, deployOutcome(in.result, api.RollbackNone, in.targetImageID, "",
+			fmt.Sprintf("%sno usable rollback target: %v", in.msgPrefix, err)))
+		return
+	}
 
-	rollbackImageID, ok, err := deployer.docker.ImageID(ctx, in.svc.Image+":"+target.Tag)
+	rollbackRef := in.svc.ImageReference(target.Tag)
+	rollbackImageID, ok, err := deployer.docker.ImageID(ctx, rollbackRef)
 	if imageUnavailable(err, ok) {
 		if pullErr := deployer.docker.Pull(ctx, composeTarget(in.svc, target.Tag)); pullErr != nil {
 			deployer.finish(in.deployID, deployOutcome(
-				api.ResultStartFailed, api.RollbackRollbackFailed, in.targetImageID, target.Tag,
+				in.result, api.RollbackRollbackFailed, in.targetImageID, target.Tag,
 				fmt.Sprintf("%srollback image %s unavailable: %v", in.msgPrefix, target.Tag, pullErr)))
 			return
 		}
-		rollbackImageID, ok, err = deployer.docker.ImageID(ctx, in.svc.Image+":"+target.Tag)
+		rollbackImageID, ok, err = deployer.docker.ImageID(ctx, rollbackRef)
 		if imageUnavailable(err, ok) {
 			deployer.finish(in.deployID, deployOutcome(
-				api.ResultStartFailed, api.RollbackRollbackFailed, in.targetImageID, target.Tag,
+				in.result, api.RollbackRollbackFailed, in.targetImageID, target.Tag,
 				fmt.Sprintf("%srollback image %s still unavailable after pull", in.msgPrefix, target.Tag)))
 			return
 		}
@@ -177,7 +206,7 @@ func (deployer *Deployer) attemptRollback(ctx context.Context, log *slog.Logger,
 
 	if err := dotenv.SetLine(in.svc.EnvFile(), in.svc.EffectiveTagEnv(), target.Tag); err != nil {
 		deployer.finish(in.deployID, deployOutcome(
-			api.ResultStartFailed, api.RollbackRollbackFailed, in.targetImageID, target.Tag,
+			in.result, api.RollbackRollbackFailed, in.targetImageID, target.Tag,
 			fmt.Sprintf("%sfailed to write .env for rollback: %v", in.msgPrefix, err)))
 		return
 	}
@@ -186,7 +215,7 @@ func (deployer *Deployer) attemptRollback(ctx context.Context, log *slog.Logger,
 	ready := upErr == nil && deployer.waitReady(ctx, in.svc, rollbackImageID)
 	if upErr == nil && ready {
 		deployer.finish(in.deployID, deployOutcome(
-			api.ResultStartFailed, api.RollbackRolledBack, in.targetImageID, target.Tag,
+			in.result, api.RollbackRolledBack, in.targetImageID, target.Tag,
 			in.msgPrefix+fmt.Sprintf("rolled back to %s", target.Tag)))
 		return
 	}
@@ -198,7 +227,7 @@ func (deployer *Deployer) attemptRollback(ctx context.Context, log *slog.Logger,
 		rollbackMsg = "rollback readiness check timed out"
 	}
 	deployer.finish(in.deployID, deployOutcome(
-		api.ResultStartFailed, api.RollbackRollbackFailed, in.targetImageID, target.Tag,
+		in.result, api.RollbackRollbackFailed, in.targetImageID, target.Tag,
 		in.msgPrefix+rollbackMsg))
 }
 

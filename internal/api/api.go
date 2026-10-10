@@ -18,6 +18,9 @@ const (
 	ResultConfigInvalid Result = "config_invalid"
 	// ResultStartFailed means the service did not become ready.
 	ResultStartFailed Result = "start_failed"
+	// ResultPostDeployFailed means the service became ready but its fixed
+	// post_deploy command exited non-zero or timed out.
+	ResultPostDeployFailed Result = "post_deploy_failed"
 	// ResultInterrupted means the agent stopped while the deploy was in progress.
 	ResultInterrupted Result = "interrupted"
 )
@@ -64,6 +67,11 @@ const (
 	ErrCertNotRegistered ErrorCode = "cert_not_registered"
 	// ErrCertRevoked means the client certificate was revoked.
 	ErrCertRevoked ErrorCode = "cert_revoked"
+	// ErrCertNotAllowed means the client certificate is not bound to the
+	// requested service (services.yaml access.clients).
+	ErrCertNotAllowed ErrorCode = "cert_not_allowed"
+	// ErrBodyTooLarge means the request body exceeded the size limit.
+	ErrBodyTooLarge ErrorCode = "body_too_large"
 	// ErrAlreadyDeploying means another deploy of the service is in progress.
 	ErrAlreadyDeploying ErrorCode = "already_deploying"
 	// ErrInternal means the agent hit an unexpected failure.
@@ -76,17 +84,21 @@ type ErrorResponse struct {
 	Message string    `json:"message"`
 }
 
-// DeployRequest is the body of POST /v1/deploy.
+// DeployRequest is the body of POST /v1/deploy. Exactly one of Tag and
+// Digest must be set; Digest ("sha256:<64 hex>") is only accepted by
+// services configured with image_ref: digest, which in turn reject Tag.
 type DeployRequest struct {
 	Service string `json:"service"`
-	Tag     string `json:"tag"`
+	Tag     string `json:"tag,omitempty"`
+	Digest  string `json:"digest,omitempty"`
 }
 
 // DeployAccepted is the 202 response body of POST /v1/deploy.
 type DeployAccepted struct {
 	DeployID string `json:"deploy_id"`
 	Service  string `json:"service"`
-	Tag      string `json:"tag"`
+	Tag      string `json:"tag,omitempty"`
+	Digest   string `json:"digest,omitempty"`
 	State    State  `json:"state"`
 }
 

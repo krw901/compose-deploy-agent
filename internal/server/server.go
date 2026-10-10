@@ -20,12 +20,39 @@ import (
 	"github.com/krwu/compose-deploy-agent/internal/store"
 )
 
+// Connection limits applied to every listener. The main listener is meant
+// to be reachable from CI (possibly through a TCP passthrough on a public
+// 443), so a slow or idle client must not be able to hold connections or
+// goroutines open indefinitely.
+const (
+	// defaultReadHeaderTimeout also bounds the TLS handshake: net/http
+	// uses the smallest non-zero read/write timeout as the handshake
+	// deadline.
+	defaultReadHeaderTimeout = 10 * time.Second
+	defaultReadTimeout       = 30 * time.Second
+	defaultWriteTimeout      = 30 * time.Second
+	defaultIdleTimeout       = 60 * time.Second
+	maxHeaderBytes           = 16 << 10
+	// maxRequestBodyBytes caps request bodies; a deploy request is a few
+	// hundred bytes.
+	maxRequestBodyBytes = 64 << 10
+)
+
+// serverTimeouts are the per-listener http.Server timeouts; tests shrink them.
+type serverTimeouts struct {
+	readHeader time.Duration
+	read       time.Duration
+	write      time.Duration
+	idle       time.Duration
+}
+
 // Server bundles everything the HTTP handlers need.
 type Server struct {
 	deployer  *deployer.Deployer
 	store     *store.Store
 	version   string
 	startedAt time.Time
+	timeouts  serverTimeouts
 }
 
 // New returns a Server ready to build handlers for.
@@ -35,6 +62,25 @@ func New(dep *deployer.Deployer, s *store.Store, version string) *Server {
 		store:     s,
 		version:   version,
 		startedAt: time.Now(),
+		timeouts: serverTimeouts{
+			readHeader: defaultReadHeaderTimeout,
+			read:       defaultReadTimeout,
+			write:      defaultWriteTimeout,
+			idle:       defaultIdleTimeout,
+		},
+	}
+}
+
+// newHTTPServer returns an http.Server for handler with the connection
+// limits applied.
+func (s *Server) newHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: s.timeouts.readHeader,
+		ReadTimeout:       s.timeouts.read,
+		WriteTimeout:      s.timeouts.write,
+		IdleTimeout:       s.timeouts.idle,
+		MaxHeaderBytes:    maxHeaderBytes,
 	}
 }
 
@@ -56,11 +102,9 @@ func (s *Server) MainListener(ctx context.Context, addr string, tlsConfig *tls.C
 func (server *Server) ServeMainOn(ctx context.Context, ln net.Listener, tlsConfig *tls.Config) error {
 	demux := newProtoDemux(ln)
 
-	tlsSrv := &http.Server{
-		Handler:   fingerprintMiddleware(server.store)(server.mainRouter()),
-		TLSConfig: tlsConfig,
-	}
-	plainSrv := &http.Server{Handler: server.publicRouter()}
+	tlsSrv := server.newHTTPServer(fingerprintMiddleware(server.store)(server.mainRouter()))
+	tlsSrv.TLSConfig = tlsConfig
+	plainSrv := server.newHTTPServer(server.publicRouter())
 
 	errCh := make(chan error, 2)
 	go func() { errCh <- tlsSrv.Serve(tls.NewListener(demux.tls, tlsConfig)) }()
@@ -87,10 +131,8 @@ func (server *Server) ServeMainOn(ctx context.Context, ln net.Listener, tlsConfi
 // HealthzListener starts the plain-HTTP healthz listener, always bound to
 // loopback so that monitoring never needs a client certificate.
 func (s *Server) HealthzListener(ctx context.Context, addr string) error {
-	srv := &http.Server{
-		Addr:    addr,
-		Handler: s.healthzRouter(),
-	}
+	srv := s.newHTTPServer(s.healthzRouter())
+	srv.Addr = addr
 	return serveUntilDone(ctx, srv, srv.ListenAndServe)
 }
 
@@ -118,7 +160,7 @@ func (s *Server) LocalListener(ctx context.Context, socketPath string) error {
 		ln.Close()
 		return err
 	}
-	srv := &http.Server{Handler: s.mainRouter()}
+	srv := s.newHTTPServer(s.mainRouter())
 	return serveUntilDone(ctx, srv, func() error {
 		return srv.Serve(ln)
 	})

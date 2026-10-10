@@ -40,6 +40,7 @@ type Options struct {
 	Endpoint       string
 	Service        string
 	Tag            string
+	Digest         string
 	CredentialPEM  []byte
 	ConnectTimeout time.Duration
 	PollInterval   time.Duration
@@ -73,7 +74,8 @@ func (o Options) withDefaults() Options {
 type Summary struct {
 	DeployID string   `json:"deploy_id,omitempty"`
 	Service  string   `json:"service"`
-	Tag      string   `json:"tag"`
+	Tag      string   `json:"tag,omitempty"`
+	Digest   string   `json:"digest,omitempty"`
 	Result   string   `json:"result,omitempty"`
 	Rollback string   `json:"rollback,omitempty"`
 	ImageID  string   `json:"image_id,omitempty"`

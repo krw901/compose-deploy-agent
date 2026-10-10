@@ -60,6 +60,22 @@ type fakeRunner struct {
 	restartCount   int
 
 	upOutcomes []upOutcome
+
+	// refSep joins imageBase and the version: ":" for tags, "@" for digests.
+	refSep string
+	// execArgs records the full docker argv of every `compose exec` call.
+	execArgs [][]string
+	// execExitCode, if non-zero, is the exit code `compose exec` returns.
+	execExitCode int
+	// execHang makes `compose exec` block until its context is done,
+	// simulating a command that never finishes.
+	execHang bool
+}
+
+// execOutcome is the scripted result of a `compose exec` call.
+type execOutcome struct {
+	exitCode int
+	hang     bool
 }
 
 func newFakeRunner(imageBase string) *fakeRunner {
@@ -68,6 +84,7 @@ func newFakeRunner(imageBase string) *fakeRunner {
 		images:       map[string]string{},
 		registry:     map[string]string{},
 		pullErrByTag: map[string]error{},
+		refSep:       ":",
 	}
 }
 
@@ -79,14 +96,46 @@ func (f *fakeRunner) setInitialRunning(tag, imageID string, hasHealthcheck, heal
 	f.hasHealthcheck = hasHealthcheck
 	f.healthy = healthy
 	f.running = running
-	f.images[f.imageBase+":"+tag] = imageID
+	f.images[f.ref(tag)] = imageID
 }
 
 func (f *fakeRunner) queueUp(o upOutcome) {
 	f.upOutcomes = append(f.upOutcomes, o)
 }
 
-func (f *fakeRunner) ref(tag string) string { return f.imageBase + ":" + tag }
+func (f *fakeRunner) ref(tag string) string { return f.imageBase + f.refSep + tag }
+
+func (f *fakeRunner) recordedExecArgs() [][]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.execArgs)
+}
+
+// runExec simulates `docker compose -f <file> exec ...` without holding the
+// runner lock while it blocks, so a hanging exec only ends via ctx.
+func (f *fakeRunner) runExec(ctx context.Context, argv []string) (dockerx.Output, error) {
+	f.mu.Lock()
+	f.execArgs = append(f.execArgs, slices.Clone(argv))
+	outcome := execOutcome{
+		exitCode: f.execExitCode,
+		hang:     f.execHang,
+	}
+	f.mu.Unlock()
+
+	if outcome.hang {
+		<-ctx.Done()
+		return dockerx.Output{ExitCode: -1, Stderr: "signal: killed"}, ctx.Err()
+	}
+	if outcome.exitCode != 0 {
+		err := fmt.Errorf("exit status %d", outcome.exitCode)
+		return dockerx.Output{ExitCode: outcome.exitCode, Stderr: "preview-init failed"}, err
+	}
+	return dockerx.Output{Stdout: "ok"}, nil
+}
+
+func isComposeExec(name string, args []string) bool {
+	return name == "docker" && len(args) > 3 && args[0] == "compose" && args[3] == "exec"
+}
 
 func (f *fakeRunner) recordedPullArgs() [][]string {
 	f.mu.Lock()
@@ -100,7 +149,10 @@ func (f *fakeRunner) currentRunning() (tag, imageID string) {
 	return f.runningTag, f.runningImageID
 }
 
-func (runner *fakeRunner) Run(_ context.Context, dir string, extraEnv []string, name string, args ...string) (dockerx.Output, error) {
+func (runner *fakeRunner) Run(ctx context.Context, dir string, extraEnv []string, name string, args ...string) (dockerx.Output, error) {
+	if isComposeExec(name, args) {
+		return runner.runExec(ctx, args)
+	}
 	runner.mu.Lock()
 	defer runner.mu.Unlock()
 
